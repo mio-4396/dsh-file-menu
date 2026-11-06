@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "File Context Menu",
+    "description": "Right-click or double-click a file name in the conversation to open it with its default desktop application, and copy its absolute path from the menu."
+  }
+}

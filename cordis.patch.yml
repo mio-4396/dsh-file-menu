@@ -1,0 +1,7 @@
+# dsh-file-menu — insert the Host half (the native opener routes the browser
+# half calls). The Client half is declared by `dsh.client` in package.json and
+# carries the same id, so package name, Host row id and Client module id match
+# the convention the shipped bundles use.
+- insert:
+    - id: dsh-file-menu
+      name: 'dsh-file-menu'
