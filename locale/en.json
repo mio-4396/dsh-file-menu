@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "File Context Menu",
-    "description": "Right-click or double-click a file name in the conversation to open it with its default desktop application, and copy its absolute path from the menu."
+    "description": "Right-click a file name in the conversation to pick an application from its \"Open with\" list or choose another app in the system dialog, and copy its absolute path; double-click still opens it with the default application."
   }
 }

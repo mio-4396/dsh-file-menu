@@ -3,8 +3,9 @@
  *
  * Adds a right-click menu to file names in the conversation. A left click keeps
  * doing what it always did (the right Sidebar preview); a right click offers what
- * a preview cannot: open the file with its default desktop application, or copy
- * its absolute path. A double click opens it straight away.
+ * a preview cannot: the applications that can open the file — the same list the
+ * Shell's own "Open with" menu shows — or copying its absolute path. A double
+ * click still opens the file with its default application.
  *
  * The shell loads this as an external classic script, so the whole file is one
  * immediately-invoked function: a rebuild evaluates it again in the realm the
@@ -34,6 +35,9 @@
       /** Most candidates kept per gesture, nearest first. */
       const MAX_CANDIDATES = 8
 
+      /** Most applications listed in the menu; the dialog holds the rest. */
+      const MAX_APPS = 8
+
       /** How far up the DOM to look for the element that owns the path. */
       const MAX_DOM_HOPS = 6
 
@@ -43,7 +47,11 @@
       const COPY = {
         zh: {
           menuTitle: '文件',
-          open: '用默认程序打开',
+          openWith: '打开方式',
+          openDefault: '用默认程序打开',
+          chooseOther: '选择其他应用…',
+          loadingApps: '正在查找可用的应用…',
+          defaultBadge: '默认',
           copy: '复制完整路径',
           checking: '正在检查文件…',
           missing: '找不到这个文件',
@@ -52,7 +60,11 @@
         },
         en: {
           menuTitle: 'File',
-          open: 'Open with default app',
+          openWith: 'Open with',
+          openDefault: 'Open with default app',
+          chooseOther: 'Choose another app…',
+          loadingApps: 'Looking for applications…',
+          defaultBadge: 'Default',
           copy: 'Copy full path',
           checking: 'Checking the file…',
           missing: 'This file was not found',
@@ -63,6 +75,9 @@
 
       /** Pending toast dismiss timer; the store owns exactly one. */
       let toastTimer = null
+
+      /** Bumped per application-list request, so a stale answer is dropped. */
+      let appsRequest = 0
 
       /** One shared menu state; the overlay component subscribes to it. */
       const store = {
@@ -80,6 +95,10 @@
           tone: 'plain',
           busy: false,
           cwd: '',
+          apps: [],
+          /** idle | loading | ready | unavailable | hidden */
+          appsStatus: 'hidden',
+          appsPlatform: '',
           toastText: '',
           toastTone: 'plain',
         },
@@ -126,6 +145,9 @@
             tone: 'plain',
             busy: false,
             cwd: typeof cwd === 'string' ? cwd : '',
+            apps: [],
+            appsStatus: 'loading',
+            appsPlatform: '',
           })
         },
         close() {
@@ -509,6 +531,40 @@
         return { candidate: undefined, answer: undefined, firstAnswer }
       }
 
+      /**
+       * Ask the Host for the applications that can open one file.
+       *
+       * The answer is asynchronous and can outlive the menu it belongs to, so a
+       * late answer is dropped instead of replacing the list of a newer gesture.
+       */
+      async function loadApps(file) {
+        const token = (appsRequest += 1)
+        try {
+          const answer = await post('/apps', { path: file })
+          if (token !== appsRequest) return
+          if (answer === null || typeof answer !== 'object' || answer.ok !== true) {
+            store.update({ apps: [], appsStatus: 'unavailable', appsPlatform: '' })
+            return
+          }
+          const items = Array.isArray(answer.items) ? answer.items : []
+          const apps = []
+          for (const item of items) {
+            if (item === null || typeof item !== 'object') continue
+            if (typeof item.name !== 'string' || item.name.trim() === '') continue
+            apps.push({ name: item.name, default: item.default === true })
+            if (apps.length >= MAX_APPS) break
+          }
+          store.update({
+            apps,
+            appsStatus: 'ready',
+            appsPlatform: typeof answer.platform === 'string' ? answer.platform : '',
+          })
+        } catch {
+          if (token !== appsRequest) return
+          store.update({ apps: [], appsStatus: 'unavailable', appsPlatform: '' })
+        }
+      }
+
       /** Fill the open menu with the path the Host confirmed. */
       async function verify(candidates, cwd) {
         const token = candidates.join('\u0000')
@@ -517,20 +573,26 @@
           outcome = await resolveCandidates(candidates, cwd)
         } catch {
           if (store.state.candidates.join('\u0000') !== token) return
-          store.update({ note: text('failed'), tone: 'error' })
+          store.update({ note: text('failed'), tone: 'error', appsStatus: 'hidden' })
           return
         }
         if (store.state.candidates.join('\u0000') !== token) return
         if (outcome.answer !== undefined) {
+          const resolved = typeof outcome.answer.path === 'string' ? outcome.answer.path : ''
+          const isFile = outcome.answer.isFile === true
           store.update({
             chosen: outcome.candidate,
-            resolved: typeof outcome.answer.path === 'string' ? outcome.answer.path : '',
+            resolved,
             exists: true,
-            isFile: outcome.answer.isFile === true,
+            isFile,
             isDirectory: outcome.answer.isDirectory === true,
             note: '',
             tone: 'plain',
+            apps: [],
+            appsStatus: isFile && resolved !== '' ? 'loading' : 'hidden',
+            appsPlatform: '',
           })
+          if (isFile && resolved !== '') void loadApps(resolved)
           return
         }
         if (outcome.firstAnswer !== undefined) {
@@ -539,10 +601,12 @@
             exists: false,
             note: text('missing'),
             tone: 'warn',
+            apps: [],
+            appsStatus: 'hidden',
           })
           return
         }
-        store.update({ exists: false, note: text('missing'), tone: 'warn' })
+        store.update({ exists: false, note: text('missing'), tone: 'warn', apps: [], appsStatus: 'hidden' })
       }
 
       /**
@@ -592,6 +656,38 @@
         }
       }
 
+      /** Open the path with one named application from the list. */
+      async function runApp(path, app) {
+        if (store.state.busy) return
+        store.update({ busy: true, note: '', tone: 'plain' })
+        try {
+          const answer = await post('/open', { path, app })
+          if (answer?.opened === true) {
+            store.close()
+            return
+          }
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        } catch {
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        }
+      }
+
+      /** Let the user pick an application in the Shell's own dialog. */
+      async function openDialog(path) {
+        if (store.state.busy) return
+        store.update({ busy: true, note: '', tone: 'plain' })
+        try {
+          const answer = await post('/openwith', { path })
+          if (answer?.ok === true) {
+            store.close()
+            return
+          }
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        } catch {
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        }
+      }
+
       async function copyPath(path) {
         try {
           await navigator.clipboard.writeText(path)
@@ -631,16 +727,75 @@
           {
             type: 'button',
             role: 'menuitem',
-            className: 'dsh-file-menu-item',
+            className: options.className ?? 'dsh-file-menu-item',
             disabled: options.disabled === true,
             onClick: options.onClick,
           },
           h('span', { className: 'dsh-file-menu-label' }, options.label),
+          options.badge === undefined ? null : h('span', { className: 'dsh-file-menu-badge' }, options.badge),
         )
       }
 
+      /** The applications the Shell offers for this file type. */
+      function appsSection(state, target) {
+        if (state.appsStatus === 'hidden' || state.appsStatus === 'idle') return null
+        const busy = state.busy === true
+
+        if (state.appsStatus === 'loading') {
+          return h(
+            'div',
+            { className: 'dsh-file-menu-section' },
+            h('div', { className: 'dsh-file-menu-caption' }, text('openWith')),
+            h(
+              'div',
+              { className: 'dsh-file-menu-loading', role: 'status' },
+              h('span', { className: 'dsh-file-menu-spinner' }),
+              text('loadingApps'),
+            ),
+          )
+        }
+
+        if (state.appsStatus === 'unavailable') {
+          return h(
+            'div',
+            { className: 'dsh-file-menu-section' },
+            item({
+              label: text('openDefault'),
+              disabled: !ready(state) || state.isDirectory === true || busy,
+              onClick: () => void run(target),
+            }),
+          )
+        }
+
+        // ready: the Shell listed the handlers this file type can be opened with.
+        const rows = state.apps.map((app) =>
+          item({
+            className: 'dsh-file-menu-app',
+            label: app.name,
+            badge: app.default ? text('defaultBadge') : undefined,
+            disabled: !ready(state) || state.isDirectory === true || busy,
+            onClick: () => void runApp(target, app.name),
+          }),
+        )
+        return h(
+          'div',
+          { className: 'dsh-file-menu-section' },
+          h('div', { className: 'dsh-file-menu-caption' }, text('openWith')),
+          h('div', { className: 'dsh-file-menu-apps' }, rows),
+          item({
+            className: 'dsh-file-menu-app is-more',
+            label: text('chooseOther'),
+            disabled: !ready(state) || state.isDirectory === true || busy,
+            onClick: () => void openDialog(target),
+          }),
+        )
+      }
+
+      function ready(state) {
+        return state.exists === true
+      }
+
       function buildMenu(state) {
-        const ready = state.exists === true
         const target = targetOf(state)
         const noteClass =
           state.tone === 'error'
@@ -651,8 +806,14 @@
                 ? 'dsh-file-menu-note is-ok'
                 : 'dsh-file-menu-note'
 
-        const estimatedWidth = 268
-        const estimatedHeight = 168 + (state.note === '' ? 0 : 22)
+        const appRows =
+          state.appsStatus === 'ready'
+            ? Math.min(state.apps.length, 5) + 1
+            : state.appsStatus === 'loading' || state.appsStatus === 'unavailable'
+              ? 1
+              : 0
+        const estimatedWidth = 276
+        const estimatedHeight = 104 + appRows * 31 + (state.note === '' ? 0 : 22)
         const x = Math.max(8, Math.min(state.x, (window.innerWidth || 1024) - estimatedWidth - 8))
         const y = Math.max(8, Math.min(state.y, (window.innerHeight || 768) - estimatedHeight - 8))
 
@@ -670,14 +831,10 @@
             },
             head(state),
             state.note === '' ? null : h('div', { className: noteClass }, state.note),
+            appsSection(state, target),
             h(
               'div',
               { className: 'dsh-file-menu-items' },
-              item({
-                label: text('open'),
-                disabled: !ready || state.isDirectory === true || state.busy === true,
-                onClick: () => void run(target),
-              }),
               item({
                 label: text('copy'),
                 disabled: target === '' || state.busy === true,
@@ -859,7 +1016,7 @@
 .dsh-file-menu-toast.is-warn { color: var(--dsw-alias-state-warn-primary, #b7791f); }
 .dsh-file-menu-toast.is-error { color: var(--dsw-alias-state-error-primary, #d33b3b); }
 .dsh-file-menu {
-  position: fixed; min-width: 208px; max-width: 320px; padding: 5px;
+  position: fixed; min-width: 224px; max-width: 340px; padding: 5px;
   pointer-events: auto; box-sizing: border-box;
   background: var(--dsw-alias-bg-overlay, #ffffff);
   border: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.1));
@@ -883,23 +1040,58 @@
 .dsh-file-menu-note.is-warn { color: var(--dsw-alias-state-warn-primary, #b7791f); }
 .dsh-file-menu-note.is-error { color: var(--dsw-alias-state-error-primary, #d33b3b); }
 .dsh-file-menu-note.is-ok { color: var(--dsw-alias-state-success-primary, #2f9e5f); }
+.dsh-file-menu-section { display: flex; flex-direction: column; gap: 1px; }
+.dsh-file-menu-caption {
+  padding: 5px 8px 3px; font-size: 11px; font-weight: 600;
+  color: var(--dsw-alias-label-secondary, #646a73);
+}
+.dsh-file-menu-apps {
+  display: flex; flex-direction: column; gap: 1px;
+  max-height: 188px; overflow-y: auto; overscroll-behavior: contain;
+}
+.dsh-file-menu-apps::-webkit-scrollbar { width: 8px; }
+.dsh-file-menu-apps::-webkit-scrollbar-thumb {
+  background: var(--dsw-alias-border-l1, rgba(0,0,0,0.14)); border-radius: 4px;
+}
 .dsh-file-menu-items {
-  display: flex; flex-direction: column; gap: 1px; padding-top: 4px;
+  display: flex; flex-direction: column; gap: 1px; padding-top: 4px; margin-top: 4px;
   border-top: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.1));
 }
-.dsh-file-menu-item {
+.dsh-file-menu-item, .dsh-file-menu-app {
   display: flex; align-items: center; width: 100%; box-sizing: border-box;
-  height: 30px; padding: 0 9px; border: 0; border-radius: 6px;
+  height: 30px; flex: 0 0 auto; padding: 0 9px; border: 0; border-radius: 6px;
   background: transparent; font: inherit; font-size: 13px; text-align: left;
   color: var(--dsw-alias-label-primary, #1f2329); cursor: pointer;
 }
-.dsh-file-menu-item:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05)); }
-.dsh-file-menu-item:focus-visible {
+.dsh-file-menu-item:hover:not(:disabled), .dsh-file-menu-app:hover:not(:disabled) {
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05));
+}
+.dsh-file-menu-item:focus-visible, .dsh-file-menu-app:focus-visible {
   outline: 2px solid var(--dsw-alias-brand-primary, #247bbf);
   outline-offset: -1px;
 }
-.dsh-file-menu-item:disabled { color: var(--dsw-alias-state-idle-primary, #a0a5ad); cursor: default; }
-.dsh-file-menu-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-file-menu-item:disabled, .dsh-file-menu-app:disabled {
+  color: var(--dsw-alias-state-idle-primary, #a0a5ad); cursor: default;
+}
+.dsh-file-menu-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-file-menu-badge {
+  flex: 0 0 auto; margin-left: 6px; padding: 0 5px; height: 16px; line-height: 16px;
+  border-radius: 4px; font-size: 10px;
+  color: var(--dsw-alias-label-secondary, #646a73);
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05));
+}
+.dsh-file-menu-app.is-more { color: var(--dsw-alias-label-secondary, #646a73); }
+.dsh-file-menu-loading {
+  display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 9px;
+  font-size: 12px; color: var(--dsw-alias-label-secondary, #646a73);
+}
+.dsh-file-menu-spinner {
+  width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto;
+  border: 1.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.14));
+  border-top-color: var(--dsw-alias-brand-primary, #247bbf);
+  animation: dsh-file-menu-spin 0.8s linear infinite;
+}
+@keyframes dsh-file-menu-spin { to { transform: rotate(360deg); } }
 `
 
       return { name: 'dsh-file-menu', inject: ['slots', 'sessions', 'locale'], apply }

@@ -1,21 +1,29 @@
 /**
  * dsh-file-menu — Host half.
  *
- * The browser cannot hand a local path to the desktop, so this half owns the one
- * thing the context menu cannot do by itself: turning a path shown in the
- * conversation into a launched native application (or a file-manager selection).
+ * The browser cannot hand a local path to the desktop, and it cannot ask Windows
+ * which applications can open a file type. This half owns both: the routes turn
+ * a path shown in the conversation into a launched native application (or a
+ * file-manager selection), and they list the handlers the Shell itself would
+ * offer in its own "Open with" menu.
  *
  * The page reaches these routes over the web server the same way the shipped
  * settings pages do; the routes only ever receive a path string and answer with
  * JSON, so a failure is visible in the menu instead of disappearing into the
  * browser console.
  *
+ * Listing and launching a chosen handler need the Shell association API, which
+ * Node does not expose, so `openwith.ps1` runs that part through powershell.exe
+ * and prints one JSON line. Everything else stays in this process.
+ *
  * @module dsh-file-menu
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 
 export const name = 'dsh-file-menu'
 
@@ -27,6 +35,26 @@ const MAX_BODY = 64 * 1024
 
 /** Longest path accepted from the page. */
 const MAX_PATH = 4096
+
+/** The PowerShell half that talks to the Shell association API. */
+const HELPER = fileURLToPath(new URL('./openwith.ps1', import.meta.url))
+
+/** How long one helper call may take before the menu is told it failed. */
+const HELPER_TIMEOUT = 20 * 1000
+
+/** How long the "Open with" dialog may take to report that it opened. */
+const DIALOG_ACK_TIMEOUT = 10 * 1000
+
+/** How long an application list stays fresh. */
+const APPS_TTL = 60 * 1000
+
+/** Applications listed in one menu; the rest are one click away in the dialog. */
+const MAX_APPS = 8
+
+const execFileAsync = promisify(execFile)
+
+/** Cached application lists, keyed by lower-cased extension. */
+const appCache = new Map()
 
 /** Write one JSON answer. */
 function sendJson(res, status, body) {
@@ -172,6 +200,163 @@ function launch(command, args) {
   })
 }
 
+/* ------------------------------------------------------------------------- *
+ * Shell association helper
+ * ------------------------------------------------------------------------- */
+
+/** The extension a path carries, lower-cased, or "" when it has none. */
+function extensionOf(file) {
+  const extension = path.extname(file)
+  return extension === '' ? '' : extension.toLowerCase()
+}
+
+/** Parse the JSON answer the helper printed, ignoring any chatter around it. */
+function parseAnswer(text) {
+  const source = String(text ?? '')
+  const lines = source.split(/\r?\n/)
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim()
+    if (!line.startsWith('{') || !line.endsWith('}')) continue
+    try {
+      const value = JSON.parse(line)
+      if (value !== null && typeof value === 'object') return value
+    } catch {
+      // A truncated or half-written line is skipped in favour of an earlier one.
+    }
+  }
+  return undefined
+}
+
+/** The arguments that make the helper answer for one file. */
+function helperArgs(action, file, extra) {
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    HELPER,
+    '-Action',
+    action,
+    '-Path',
+    file,
+    ...(extra ?? []),
+  ]
+}
+
+/**
+ * Run the helper once and return its answer.
+ *
+ * The helper reports a failure as `{ok:false}` with a non-zero exit code, so an
+ * error from `execFile` still carries the answer on stdout; anything unreadable
+ * becomes a plain failure for the caller to show or fall back from.
+ */
+async function runHelper(action, file, extra) {
+  const args = helperArgs(action, file, extra)
+  try {
+    const { stdout } = await execFileAsync('powershell.exe', args, {
+      windowsHide: true,
+      timeout: HELPER_TIMEOUT,
+      maxBuffer: 4 * 1024 * 1024,
+      encoding: 'utf8',
+    })
+    return parseAnswer(stdout) ?? { ok: false, error: 'unreadable-answer' }
+  } catch (error) {
+    const answer = parseAnswer(typeof error?.stdout === 'string' ? error.stdout : '')
+    if (answer !== undefined) return answer
+    return { ok: false, error: String(error?.message ?? error) }
+  }
+}
+
+/**
+ * Show the Shell's own "How do you want to open this file?" dialog.
+ *
+ * The dialog is modal: the helper process blocks until the user closes it. The
+ * answer the helper prints *before* entering the dialog therefore decides the
+ * request, and the process is left running so the dialog stays up.
+ *
+ * This spawn deliberately omits `windowsHide`: the Shell will not show the
+ * dialog for a process started with a hidden show-state, so the helper hides its
+ * own console window right after start instead.
+ */
+function showDialog(file) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn('powershell.exe', helperArgs('dialog', file), {
+        windowsHide: false,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+    } catch (error) {
+      resolve({ ok: false, error: String(error?.message ?? error) })
+      return
+    }
+
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish({ ok: true, dialog: true }), DIALOG_ACK_TIMEOUT)
+
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      const answer = parseAnswer(chunk)
+      if (answer === undefined) return
+      if (answer.ok === true) {
+        finish({ ok: true, dialog: true })
+        return
+      }
+      finish(answer)
+      try {
+        child.kill()
+      } catch {
+        // An already finished helper needs no cleanup.
+      }
+    })
+    child.stdout.on('error', () => finish({ ok: false, error: 'helper-pipe-failed' }))
+    child.once('error', (error) => finish({ ok: false, error: String(error?.message ?? error) }))
+    child.once('exit', () => finish({ ok: false, error: 'dialog-closed-before-showing' }))
+  })
+}
+
+/** The applications the Shell offers for one file, most useful first. */
+function normalizeApps(items) {
+  if (!Array.isArray(items)) return []
+  const seen = new Set()
+  const apps = []
+  for (const item of items) {
+    if (item === null || typeof item !== 'object') continue
+    const appName = typeof item.name === 'string' ? item.name.trim() : ''
+    if (appName === '' || seen.has(appName)) continue
+    seen.add(appName)
+    apps.push({
+      name: appName,
+      default: item.default === true,
+      recommended: item.recommended !== false,
+    })
+  }
+  apps.sort((left, right) => (left.default === right.default ? 0 : left.default ? -1 : 1))
+  return apps.slice(0, MAX_APPS)
+}
+
+/** The cached list for one extension, when it is still fresh. */
+function cachedApps(extension) {
+  const entry = appCache.get(extension)
+  if (entry === undefined) return undefined
+  if (Date.now() - entry.at > APPS_TTL) {
+    appCache.delete(extension)
+    return undefined
+  }
+  return entry.value
+}
+
+/* ------------------------------------------------------------------------- *
+ * Routes
+ * ------------------------------------------------------------------------- */
+
 /** Register the routes that launch native applications. */
 function registerRoutes(ctx, webServer) {
 
@@ -193,11 +378,33 @@ function registerRoutes(ctx, webServer) {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const route = url.pathname.slice(ROUTE_PREFIX.length)
     try {
-      if (route === '/open' && req.method === 'POST') {
+      /** Every route that acts on a path starts here. */
+      const resolve = async () => {
         const body = await readJson(req)
-        const target = resolveRequest(body.path, directories())
+        return { body, target: resolveRequest(body.path, directories()) }
+      }
+
+      if (route === '/open' && req.method === 'POST') {
+        const { body, target } = await resolve()
         if (target.ok !== true) return sendJson(res, 200, { opened: false, ...target })
         if (target.exists !== true) return sendJson(res, 200, { opened: false, ...target, error: 'not-found' })
+
+        // A named application means one handler from the "Open with" list; no
+        // name keeps the old behaviour of the desktop's default association.
+        const app = typeof body.app === 'string' ? body.app.trim() : ''
+        if (app !== '') {
+          if (process.platform !== 'win32') {
+            return sendJson(res, 200, { opened: false, app, ...target, error: 'unsupported-platform' })
+          }
+          const answer = await runHelper('invoke', target.path, ['-AppName', app])
+          return sendJson(res, 200, {
+            opened: answer.ok === true,
+            app,
+            ...target,
+            error: answer.ok === true ? undefined : (answer.error ?? 'app-failed'),
+          })
+        }
+
         if (target.isDirectory === true) {
           const revealed = await launch(...revealOpener(target.path))
           return sendJson(res, 200, { opened: revealed.ok === true, revealed: revealed.ok === true, ...target, error: revealed.error })
@@ -205,9 +412,48 @@ function registerRoutes(ctx, webServer) {
         const opened = await launch(...fileOpener(target.path))
         return sendJson(res, 200, { opened: opened.ok === true, ...target, error: opened.error })
       }
+      if (route === '/apps' && req.method === 'POST') {
+        const { target } = await resolve()
+        if (target.ok !== true) return sendJson(res, 200, { ...target, ok: false })
+        if (target.exists !== true) return sendJson(res, 200, { ...target, ok: false, platform: process.platform, error: 'not-found' })
+        if (process.platform !== 'win32') {
+          return sendJson(res, 200, { ...target, ok: true, platform: process.platform, items: [] })
+        }
+        if (target.isDirectory === true) {
+          return sendJson(res, 200, { ...target, ok: true, platform: 'win32', items: [], directory: true })
+        }
+
+        const extension = extensionOf(target.path)
+        const cached = cachedApps(extension)
+        if (cached !== undefined) {
+          return sendJson(res, 200, { ...target, ok: true, platform: 'win32', fromCache: true, ...cached })
+        }
+
+        const answer = await runHelper('list', target.path)
+        if (answer.ok !== true) {
+          return sendJson(res, 200, {
+            ...target,
+            ok: false,
+            platform: 'win32',
+            error: answer.error ?? 'app-list-unavailable',
+          })
+        }
+        const value = { extension, items: normalizeApps(answer.items) }
+        appCache.set(extension, { at: Date.now(), value })
+        return sendJson(res, 200, { ...target, ok: true, platform: 'win32', ...value })
+      }
+      if (route === '/openwith' && req.method === 'POST') {
+        const { target } = await resolve()
+        if (target.ok !== true) return sendJson(res, 200, { ...target, ok: false })
+        if (target.exists !== true) return sendJson(res, 200, { ...target, ok: false, error: 'not-found' })
+        if (process.platform !== 'win32') return sendJson(res, 200, { ...target, ok: false, error: 'unsupported-platform' })
+        // The Shell may have learned a new handler while the dialog was open.
+        appCache.delete(extensionOf(target.path))
+        const answer = await showDialog(target.path)
+        return sendJson(res, 200, { ...target, ...answer })
+      }
       if (route === '/stat' && req.method === 'POST') {
-        const body = await readJson(req)
-        const target = resolveRequest(body.path, directories())
+        const { target } = await resolve()
         return sendJson(res, 200, target)
       }
       return sendJson(res, 404, { ok: false, error: 'unknown-route' })

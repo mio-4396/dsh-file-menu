@@ -1,8 +1,8 @@
 {
   "name": "dsh-file-menu",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Right-click or double-click a file name in the conversation to open it with its default desktop application, and copy its absolute path from the menu.",
+  "description": "Right-click or double-click a file name in the conversation to open it: the menu lists the applications that can open the file (the Shell's own \"Open with\" list) plus a dialog to choose another one, and copies its absolute path. A double click opens it with its default application.",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
@@ -14,6 +14,7 @@
   "files": [
     "index.js",
     "client.js",
+    "openwith.ps1",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
