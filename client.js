@@ -939,6 +939,7 @@
             if (candidates.length === 0) return
             event.preventDefault()
             event.stopPropagation()
+            cancelPendingPreview()
             const cwd = viewedDirectory(ctx)
             store.open(event.clientX, event.clientY, candidates, cwd)
             void verify(candidates, cwd)
@@ -946,17 +947,64 @@
           document.addEventListener('contextmenu', onContextMenu, true)
 
           /**
-           * Double click opens the file with its default application.
+           * Double click opens the file with no preview; a single click previews.
            *
-           * The first click has already reached the chip's own handler (the right
-           * Sidebar preview), so this gesture only takes over the second one:
-           * swallowing it keeps the preview from opening twice, and the launch is
-           * what the user asked for. `detail` is the browser's click counter for one
-           * press sequence, so `2` is exactly the second click — no timer and no
-           * delay on the normal single click.
+           * The chip's own handler opens the right Sidebar preview on the first
+           * click, so a double click would both preview the file and launch it.
+           * The first click is therefore taken over and replayed as a synthetic
+           * click after a short window. Two clicks on the same chip inside that
+           * window are one double click: the replay is cancelled and the file is
+           * launched instead. Anything slower is two single clicks and previews —
+           * the decision is made by the window, never by the browser's click
+           * counter, so the two gestures cannot disagree.
            */
+          const CLICK_WINDOW = 260
+          let pendingPreview = null
+
+          function cancelPendingPreview() {
+            if (pendingPreview === null) return
+            clearTimeout(pendingPreview.timer)
+            pendingPreview = null
+          }
+
+          /** Hand the untouched click back to the page, so its preview opens. */
+          function replayPreview(request) {
+            const target = request.target
+            if (!(target instanceof Element) || target.isConnected !== true) return
+            try {
+              const event = new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                detail: 1,
+                button: 0,
+                buttons: 0,
+                clientX: request.clientX,
+                clientY: request.clientY,
+                screenX: request.screenX,
+                screenY: request.screenY,
+              })
+              event.__dshFileMenuReplay = true
+              target.dispatchEvent(event)
+            } catch {
+              // A page that refuses synthetic events simply keeps the preview closed.
+            }
+          }
+
+          /** Whether two clicks hit the same chip (one may be a child of it). */
+          function sameChip(left, right) {
+            if (left === right) return true
+            if (!(left instanceof Element) || !(right instanceof Element)) return false
+            return left.contains(right) || right.contains(left)
+          }
+
           const onClick = (event) => {
-            if (event.detail !== 2 || event.defaultPrevented) return
+            if (event.__dshFileMenuReplay === true || event.defaultPrevented) return
+            // The menu's own rows are ordinary buttons; a delayed replay would
+            // make every selection feel laggy, so they are left alone.
+            const insideMenu = typeof event.target.closest === 'function'
+              && event.target.closest('.dsh-file-menu') !== null
+            if (insideMenu) return
             let candidates
             try {
               candidates = collectCandidates(event.target)
@@ -964,10 +1012,41 @@
               candidates = []
             }
             if (candidates.length === 0) return
+
+            const pending = pendingPreview
+            if (pending !== null && sameChip(pending.target, event.target)) {
+              // Two clicks on one chip inside the window: a double click.
+              event.preventDefault()
+              event.stopPropagation()
+              cancelPendingPreview()
+              store.close()
+              void openQuietly(candidates, viewedDirectory(ctx))
+              return
+            }
+
+            // A click on another chip: let the previous one preview right away.
+            if (pending !== null) {
+              cancelPendingPreview()
+              replayPreview(pending)
+            }
+
+            // One click so far: hold the preview back until the window closes.
             event.preventDefault()
             event.stopPropagation()
-            store.close()
-            void openQuietly(candidates, viewedDirectory(ctx))
+            const request = {
+              target: event.target,
+              clientX: event.clientX,
+              clientY: event.clientY,
+              screenX: event.screenX,
+              screenY: event.screenY,
+              timer: null,
+            }
+            request.timer = setTimeout(() => {
+              if (pendingPreview !== request) return
+              pendingPreview = null
+              replayPreview(request)
+            }, CLICK_WINDOW)
+            pendingPreview = request
           }
           document.addEventListener('click', onClick, true)
 
@@ -992,6 +1071,7 @@
           return () => {
             unsubscribeLocale()
             if (typeof disposeMenu === 'function') disposeMenu()
+            cancelPendingPreview()
             document.removeEventListener('contextmenu', onContextMenu, true)
             document.removeEventListener('click', onClick, true)
             removeStyles()
