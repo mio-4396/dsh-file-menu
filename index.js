@@ -412,6 +412,20 @@ function registerRoutes(ctx, webServer) {
         const opened = await launch(...fileOpener(target.path))
         return sendJson(res, 200, { opened: opened.ok === true, ...target, error: opened.error })
       }
+      if (route === '/copy' && req.method === 'POST') {
+        const { target } = await resolve()
+        if (target.ok !== true) return sendJson(res, 200, { ...target, ok: false })
+        if (target.exists !== true) return sendJson(res, 200, { ...target, ok: false, error: 'not-found' })
+        if (process.platform !== 'win32') return sendJson(res, 200, { ...target, ok: false, error: 'unsupported-platform' })
+        if (target.isFile !== true) return sendJson(res, 200, { ...target, ok: false, error: 'not-a-file' })
+        const answer = await runHelper('copy', target.path)
+        return sendJson(res, 200, {
+          ...target,
+          ok: answer.ok === true,
+          copied: answer.ok === true,
+          error: answer.ok === true ? undefined : (answer.error ?? 'copy-failed'),
+        })
+      }
       if (route === '/apps' && req.method === 'POST') {
         const { target } = await resolve()
         if (target.ok !== true) return sendJson(res, 200, { ...target, ok: false })

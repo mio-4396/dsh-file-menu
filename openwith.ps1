@@ -19,7 +19,7 @@
 # included, and handlers whose registration lives in several registry hives.
 
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('list', 'invoke', 'dialog')][string]$Action,
+    [Parameter(Mandatory = $true)][ValidateSet('list', 'invoke', 'dialog', 'copy')][string]$Action,
     [Parameter(Mandatory = $true)][string]$Path,
     [string]$AppName = '',
     [int]$AppIndex = -1
@@ -158,6 +158,96 @@ public static class AssocApps
         {
             Marshal.FreeHGlobal(file);
         }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool OpenClipboard(IntPtr newOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr SetClipboardData(uint format, IntPtr memory);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool CloseClipboard();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GlobalLock(IntPtr memory);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GlobalUnlock(IntPtr memory);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GlobalFree(IntPtr memory);
+
+    const uint GlobalMoveable = 0x0002;
+    const uint GlobalZeroInit = 0x0040;
+    const uint ClipboardHDrop = 15;
+
+    /// Put one file on the clipboard as a file drop, the way Explorer's Copy does.
+    /// Pasted into a folder it copies the file itself; pasted into a text field a
+    /// file drop is added as its name.
+    public static bool CopyFile(string path)
+    {
+        if (!System.IO.File.Exists(path)) return false;
+
+        // CF_HDROP payload: DROPFILES header (20 bytes) then a double-null
+        // terminated list of wide paths, the file name relative to nothing.
+        byte[] list = System.Text.Encoding.Unicode.GetBytes(path + "\0\0");
+        int size = 20 + list.Length;
+        IntPtr memory = GlobalAlloc(GlobalMoveable | GlobalZeroInit, (UIntPtr)size);
+        if (memory == IntPtr.Zero) return false;
+
+        IntPtr buffer = GlobalLock(memory);
+        if (buffer == IntPtr.Zero)
+        {
+            GlobalFree(memory);
+            return false;
+        }
+        try
+        {
+            Marshal.WriteInt32(buffer, 0, 20);  // pFiles: header size
+            Marshal.WriteInt32(buffer, 4, 0);   // pt.x
+            Marshal.WriteInt32(buffer, 8, 0);   // pt.y
+            Marshal.WriteInt32(buffer, 12, 0);  // fNC
+            Marshal.WriteInt32(buffer, 16, 1);  // fWide: Unicode list
+            Marshal.Copy(list, 0, new IntPtr(buffer.ToInt64() + 20), list.Length);
+        }
+        finally
+        {
+            GlobalUnlock(memory);
+        }
+
+        // Another process may hold the clipboard for a moment.
+        bool opened = false;
+        for (int attempt = 0; attempt < 10 && !opened; attempt++)
+        {
+            opened = OpenClipboard(IntPtr.Zero);
+            if (!opened) System.Threading.Thread.Sleep(50);
+        }
+        if (!opened)
+        {
+            GlobalFree(memory);
+            return false;
+        }
+
+        bool copied = false;
+        try
+        {
+            EmptyClipboard();
+            copied = SetClipboardData(ClipboardHDrop, memory) != IntPtr.Zero;
+        }
+        finally
+        {
+            CloseClipboard();
+        }
+        // On success the clipboard owns the block; freeing it would be a bug.
+        if (!copied) GlobalFree(memory);
+        return copied;
     }
 
     /// The extension the Shell associates, or "" for a file that carries none.
@@ -410,6 +500,19 @@ try {
     if (-not (Test-Path -LiteralPath $Path)) {
         Write-Answer '{"ok":false,"error":"path-not-found"}'
         exit 2
+    }
+
+    if ($Action -eq 'copy') {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            Write-Answer '{"ok":false,"error":"not-a-file"}'
+            exit 2
+        }
+        if ([AssocApps]::CopyFile($Path)) {
+            Write-Answer '{"ok":true,"copied":true}'
+            exit 0
+        }
+        Write-Answer '{"ok":false,"error":"clipboard-failed"}'
+        exit 3
     }
 
     if ($Action -eq 'list') {

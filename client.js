@@ -52,7 +52,9 @@
           chooseOther: '选择其他应用…',
           loadingApps: '正在查找可用的应用…',
           defaultBadge: '默认',
+          copyFile: '复制文件',
           copy: '复制完整路径',
+          copiedFile: '已复制文件',
           checking: '正在检查文件…',
           missing: '找不到这个文件',
           copied: '已复制路径',
@@ -65,7 +67,9 @@
           chooseOther: 'Choose another app…',
           loadingApps: 'Looking for applications…',
           defaultBadge: 'Default',
+          copyFile: 'Copy file',
           copy: 'Copy full path',
+          copiedFile: 'File copied',
           checking: 'Checking the file…',
           missing: 'This file was not found',
           copied: 'Path copied',
@@ -698,6 +702,23 @@
         }
       }
 
+      /** Put the file itself on the clipboard, as Explorer's Copy does. */
+      async function copyFile(path) {
+        if (store.state.busy) return
+        store.update({ busy: true, note: '', tone: 'plain' })
+        try {
+          const answer = await post('/copy', { path })
+          if (answer?.ok === true) {
+            store.update({ note: text('copiedFile'), tone: 'ok', busy: false })
+            setTimeout(() => store.close(), 700)
+            return
+          }
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        } catch {
+          store.update({ note: text('failed'), tone: 'error', busy: false })
+        }
+      }
+
       /* --------------------------------------------------------------------- *
        * The menu
        * --------------------------------------------------------------------- */
@@ -836,6 +857,11 @@
               'div',
               { className: 'dsh-file-menu-items' },
               item({
+                label: text('copyFile'),
+                disabled: !ready(state) || state.isFile !== true || state.busy === true,
+                onClick: () => void copyFile(target),
+              }),
+              item({
                 label: text('copy'),
                 disabled: target === '' || state.busy === true,
                 onClick: () => void copyPath(target),
@@ -872,15 +898,25 @@
             if (event.key === 'Escape') store.close()
           }
           const onDismiss = () => store.close()
+          /**
+           * Scrolling dismisses the menu, but not the application list's own
+           * scrolling: a capture-phase listener on window also sees scrolls from
+           * inside the menu, and closing on those would make the list unscrollable.
+           */
+          const onScroll = (event) => {
+            const target = event.target
+            if (target instanceof Element && target.closest?.('.dsh-file-menu') !== null) return
+            store.close()
+          }
           document.addEventListener('pointerdown', onPointerDown, true)
           document.addEventListener('keydown', onKeyDown, true)
-          window.addEventListener('scroll', onDismiss, true)
+          window.addEventListener('scroll', onScroll, true)
           window.addEventListener('resize', onDismiss)
           window.addEventListener('blur', onDismiss)
           return () => {
             document.removeEventListener('pointerdown', onPointerDown, true)
             document.removeEventListener('keydown', onKeyDown, true)
-            window.removeEventListener('scroll', onDismiss, true)
+            window.removeEventListener('scroll', onScroll, true)
             window.removeEventListener('resize', onDismiss)
             window.removeEventListener('blur', onDismiss)
           }

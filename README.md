@@ -7,14 +7,17 @@
 - **右键**：菜单
   - **打开方式** —— 列出这个文件类型能用的程序（与 Windows 自己的「打开方式」列表同源），当前默认程序排第一并标注「默认」；点一个即用它打开；
   - **选择其他应用…** —— 打开 Windows 的「选择一个应用以打开此文件」对话框（可改用别的程序，也可勾选设为默认）；
+  - **复制文件** —— 把文件本身放进剪贴板（`CF_HDROP`，与资源管理器「复制」一致），可以直接粘贴到文件夹；
   - **复制完整路径**。
+
+菜单里的应用列表可以滚动；菜单内部的滚动不会把菜单关掉，页面滚动才会。
 
 ## 组成
 
 | 半边 | 文件 | 作用 |
 | --- | --- | --- |
-| Host | `index.js` | 注册 `/.dsh-file-menu` 路由：`stat`（核实路径）、`apps`（列可用程序）、`open`（默认程序或指定程序）、`openwith`（系统对话框）；目录则在文件管理器中打开 |
-| Host 辅助 | `openwith.ps1` | 通过 `powershell.exe` 调 Shell 关联接口（`SHAssocEnumHandlers` / `IAssocHandler` / `SHOpenWithDialog`），输出单行 JSON |
+| Host | `index.js` | 注册 `/.dsh-file-menu` 路由：`stat`（核实路径）、`apps`（列可用程序）、`open`（默认程序或指定程序）、`openwith`（系统对话框）、`copy`（文件进剪贴板）；目录则在文件管理器中打开 |
+| Host 辅助 | `openwith.ps1` | 通过 `powershell.exe` 调 Shell 关联接口与剪贴板（`SHAssocEnumHandlers` / `IAssocHandler` / `SHOpenWithDialog` / `CF_HDROP`），输出单行 JSON |
 | Client | `client.js` | `shell.overlay` 里的右键菜单与提示条，拦截对话中文件名的 `contextmenu` 与双击 |
 
 Host 路由通过 `ctx.inject(['webServer'])` 注册：浏览器载体由别的 row 挂载，启动顺序靠后也能装上。
